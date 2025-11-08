@@ -1,0 +1,144 @@
+# ===============================================================
+# FILE: main.py
+# PURPOSE: FastAPI app that classifies text files
+# ===============================================================
+
+from fastapi import FastAPI, File, UploadFile
+from typing import List
+import magic  # to detect MIME type
+import re     # for detecting sensitive info (PII)
+from sklearn.linear_model import LogisticRegression
+import joblib
+import io
+
+app = FastAPI(title="Text File Classifier")
+
+# ---------------------------------------------------------------
+# 1️⃣ AI MODEL: Train a very simple text classifier
+# ---------------------------------------------------------------
+
+# pretend we have sample training data (text and labels)
+training_texts = [
+    "SELECT * FROM users;",              # SQL
+    "{'name': 'Alice', 'age': 25}",      # JSON
+    "column1,column2\nvalue1,value2",    # CSV
+    "def hello_world(): print('hi')",    # CODE
+    "This is a system log: error 404",   # LOG
+    "Today I went to the park.",         # NATURAL LANGUAGE
+]
+training_labels = ["sql", "json", "csv", "code", "log", "natural_language"]
+
+# A super simple vectorizer: count common keywords
+def simple_features(text):
+    features = [
+        "select", "from", "insert",          # SQL
+        "{", "}", ":",                      # JSON
+        ",", "\n",                          # CSV
+        "def", "class", "import",           # CODE
+        "error", "log", "warning",          # LOG
+        "the", "is", "and",                 # English
+    ]
+    return [text.lower().count(f) for f in features]
+
+X = [simple_features(t) for t in training_texts]
+y = training_labels
+
+model = LogisticRegression(max_iter=500)
+model.fit(X, y)
+joblib.dump(model, "text_model.pkl")
+
+# ---------------------------------------------------------------
+# 2️⃣ Helper functions
+# ---------------------------------------------------------------
+
+def detect_file_type(content: bytes):
+    """Guess the MIME type (e.g. text/plain, image/jpeg)."""
+    return magic.from_buffer(content, mime=True)
+
+def detect_pii(text: str):
+    """Look for sensitive info like SSNs, phones, emails."""
+    pii = {}
+    if re.search(r"\b\d{3}-\d{2}-\d{4}\b", text):
+        pii["SSN"] = True
+    if re.search(r"\b\d{10}\b", text):
+        pii["Phone"] = True
+    if re.search(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b", text):
+        pii["Email"] = True
+    if re.search(r"\b\d{16}\b", text):
+        pii["CreditCard"] = True
+    return pii
+
+def classify_text(text: str):
+    """Predict what kind of text it is."""
+    features = [simple_features(text)]
+    model = joblib.load("text_model.pkl")
+    prediction = model.predict(features)[0]
+    return prediction
+
+def structured_or_unstructured(pred_label: str):
+    """Decide if file is structured (rows/columns) or unstructured."""
+    structured_labels = ["csv", "json", "sql"]
+    return "structured" if pred_label in structured_labels else "unstructured"
+
+# ---------------------------------------------------------------
+# 3️⃣ API ROUTES
+# ---------------------------------------------------------------
+
+@app.post("/classify")
+async def classify_file(file: UploadFile = File(...)):
+    """Handle one uploaded file."""
+    content = await file.read()
+    mime_type = detect_file_type(content)
+
+    if "text" not in mime_type:
+        return {"error": "Only text files are supported"}
+
+    text = content.decode("utf-8", errors="ignore")
+    pred_label = classify_text(text)
+    structure = structured_or_unstructured(pred_label)
+    pii_info = detect_pii(text)
+
+    metadata = {
+        "filename": file.filename,
+        "mime_type": mime_type,
+        "predicted_label": pred_label,
+        "structure_type": structure,
+        "word_count": len(text.split()),
+        "line_count": len(text.splitlines()),
+        "pii_detected": pii_info,
+        "sample_preview": text[:100]
+    }
+
+    return metadata
+
+
+@app.post("/batch")
+async def classify_batch(files: List[UploadFile] = File(...)):
+    """Handle many files at once."""
+    results = []
+    for file in files:
+        content = await file.read()
+        mime_type = detect_file_type(content)
+
+        if "text" not in mime_type:
+            results.append({"filename": file.filename, "error": "Only text files supported"})
+            continue
+
+        text = content.decode("utf-8", errors="ignore")
+        pred_label = classify_text(text)
+        structure = structured_or_unstructured(pred_label)
+        pii_info = detect_pii(text)
+
+        metadata = {
+            "filename": file.filename,
+            "mime_type": mime_type,
+            "predicted_label": pred_label,
+            "structure_type": structure,
+            "word_count": len(text.split()),
+            "line_count": len(text.splitlines()),
+            "pii_detected": pii_info,
+        }
+        results.append(metadata)
+    return {"batch_results": results}
+
+# Run with: uvicorn main:app --reload
